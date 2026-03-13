@@ -2,11 +2,13 @@
 .SYNOPSIS
     Enables Windows Defender. Designed for NinjaOne deployment.
 .DESCRIPTION
-    1. Clears Group Policy registry overrides that disable Defender
-    2. Installs Windows Defender feature if missing (Server OS)
+    1. Clears Group Policy and passive-mode registry overrides
+    2. Installs Windows Defender feature if missing (Server 2016+)
     3. Sets WinDefend service to Automatic and starts it
     4. Enables all core protections via Set-MpPreference
     5. Triggers a signature update
+    Supports Server 2016+ and Windows 10+.
+    Server 2012 R2 requires Defender for Endpoint onboarding (not supported by this script).
     Exit code 0 = all steps succeeded, 1 = one or more steps failed.
 #>
 
@@ -22,11 +24,24 @@ function Log([string]$Level, [string]$Msg) {
     if ($Level -eq 'FAIL') { $script:ExitCode = 1 }
 }
 
+$os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+$isServer = $os.ProductType -ne 1
+$osVersion = [Environment]::OSVersion.Version
+
 Log INFO "=== Enable Windows Defender ==="
-Log INFO "Host: $env:COMPUTERNAME | OS: $([Environment]::OSVersion.VersionString) | Log: $LogPath"
+Log INFO "Host: $env:COMPUTERNAME | OS: $($os.Caption) ($osVersion) | Server: $isServer | Log: $LogPath"
 
-# -- Step 1: Clear GP registry overrides --
+# -- Check: Server 2012 R2 is not supported --
 
+if ($isServer -and $osVersion.Major -eq 6 -and $osVersion.Minor -le 3) {
+    Log FAIL "Server 2012 R2 and older are not supported. Windows Defender on Server 2012 R2 requires Microsoft Defender for Endpoint onboarding (modern unified solution). See: https://learn.microsoft.com/en-us/defender-endpoint/onboard-server"
+    Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+    exit $script:ExitCode
+}
+
+# -- Step 1: Clear registry overrides --
+
+# GP overrides that disable Defender protections
 $gpKeys = @(
     'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
     'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection'
@@ -50,85 +65,81 @@ foreach ($key in $gpKeys) {
     }
 }
 
-# -- Step 2: Ensure Windows Defender is installed --
+# ForceDefenderPassiveMode: if a third-party AV was uninstalled, Defender may be stuck in passive mode
+$passiveKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+if (Test-Path $passiveKey) {
+    $passiveProp = Get-ItemProperty -Path $passiveKey -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue
+    if ($null -ne $passiveProp -and $passiveProp.ForceDefenderPassiveMode -eq 1) {
+        try {
+            Set-ItemProperty -Path $passiveKey -Name 'ForceDefenderPassiveMode' -Value 0 -ErrorAction Stop
+            Log PASS "Cleared ForceDefenderPassiveMode (was 1, set to 0). Defender will switch to active mode."
+        } catch {
+            Log WARN "Could not clear ForceDefenderPassiveMode. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Defender may remain in passive mode."
+        }
+    }
+}
+
+# -- Step 2: Ensure Windows Defender is installed (Server only) --
 
 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
 if (-not $svc) {
-    Log WARN "WinDefend service not found. Attempting to install Windows Defender feature."
-
-    # Detect OS type and attempt installation
-    $isServer = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).ProductType -ne 1
     if ($isServer) {
-        # Server OS: use Install-WindowsFeature (available on 2012+)
         $installCmd = Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue
         if (-not $installCmd) {
-            Log FAIL "Install-WindowsFeature cmdlet not available. This server may be too old (requires Server 2012+)."
+            Log FAIL "Install-WindowsFeature cmdlet not available. Cannot install Defender feature."
             Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
             exit $script:ExitCode
         }
 
-        # Feature name varies by OS version:
-        #   Server 2016+    : Windows-Defender
-        #   Server 2012 R2  : Windows-Defender-Features, Windows-Server-Antimalware
-        #   Server 2012     : Windows-Server-Antimalware
-        $featureNames = @('Windows-Defender', 'Windows-Defender-Features', 'Windows-Server-Antimalware')
-        $targetFeature = $null
-
-        foreach ($fname in $featureNames) {
-            $feat = Get-WindowsFeature -Name $fname -ErrorAction SilentlyContinue
-            if ($feat) {
-                $targetFeature = $fname
-                if ($feat.Installed) {
-                    Log INFO "Feature '$fname' is already installed (state: $($feat.InstallState)). Service may need a reboot to appear."
-                }
-                break
-            }
-        }
-
-        if (-not $targetFeature) {
-            $available = Get-WindowsFeature -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Defend*' -or $_.Name -like '*Antimalware*' -or $_.Name -like '*Defender*' } | ForEach-Object { $_.Name }
-            $hint = if ($available) { "Similar features found: $($available -join ', ')" } else { "No Defender-related features found on this OS" }
-            Log FAIL "No known Defender feature name found. Tried: $($featureNames -join ', '). $hint. This OS may not support Windows Defender."
+        # Check if feature exists before attempting install
+        $feat = Get-WindowsFeature -Name Windows-Defender -ErrorAction SilentlyContinue
+        if (-not $feat) {
+            Log FAIL "Windows-Defender feature not found. This OS version may not support Defender. Run 'Get-WindowsFeature *Defend*' to check available features."
             Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
             exit $script:ExitCode
+        }
+
+        if ($feat.Installed) {
+            Log WARN "Windows-Defender feature is installed but WinDefend service is missing. A reboot may be required."
+            Log INFO "=== Aborted. Exit code: 1 ==="
+            exit 1
         }
 
         try {
-            Log INFO "Installing feature '$targetFeature' (this may take several minutes)."
-            $result = Install-WindowsFeature -Name $targetFeature -ErrorAction Stop
+            Log INFO "Installing Windows-Defender feature (this may take several minutes)."
+            $result = Install-WindowsFeature -Name Windows-Defender -ErrorAction Stop
             if ($result.Success) {
-                Log PASS "Feature '$targetFeature' installed successfully."
+                Log PASS "Windows-Defender feature installed."
                 if ($result.RestartNeeded -eq 'Yes') {
-                    Log WARN "REBOOT REQUIRED to complete installation. Defender will not function until the server is restarted. Re-run this script after reboot."
+                    Log WARN "REBOOT REQUIRED. Defender will not function until the server is restarted. Re-run this script after reboot."
                     Log INFO "=== Reboot required. Exit code: 1 ==="
                     exit 1
                 }
             } else {
-                Log FAIL "Install-WindowsFeature '$targetFeature' returned Success=False. Exit reason: $($result.ExitCode). Feature may be blocked by policy or partially installed."
+                Log FAIL "Install-WindowsFeature returned Success=False. Exit reason: $($result.ExitCode)."
                 Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
                 exit $script:ExitCode
             }
         } catch {
-            Log FAIL "Failed to install feature '$targetFeature'. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Run 'Get-WindowsFeature *Defend*' to check available features."
+            Log FAIL "Failed to install Windows-Defender feature. Error: $($_.Exception.GetType().Name): $($_.Exception.Message)"
             Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
             exit $script:ExitCode
         }
-    } else {
-        # Desktop OS: Defender should always be present. If the service is missing, something is seriously wrong.
-        Log FAIL "WinDefend service not found on desktop OS ($([Environment]::OSVersion.VersionString)). Defender may have been removed by third-party antivirus or system modification. Check: Get-WindowsOptionalFeature -Online -FeatureName Windows-Defender-Default-Definitions"
-        Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
-        exit $script:ExitCode
-    }
 
-    # Re-check for the service after installation
-    Start-Sleep -Seconds 5
-    $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        Log FAIL "WinDefend service still not found after feature installation. A reboot may be required."
+        # Re-check for the service after installation
+        Start-Sleep -Seconds 5
+        $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Log FAIL "WinDefend service still not found after feature installation. A reboot may be required."
+            Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+            exit $script:ExitCode
+        }
+        Log PASS "WinDefend service now available after feature installation."
+    } else {
+        Log FAIL "WinDefend service not found on desktop OS. Defender may have been removed by third-party antivirus or system modification."
         Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
         exit $script:ExitCode
     }
-    Log PASS "WinDefend service now available after feature installation."
 }
 
 # -- Step 3: Enable and start WinDefend service --
@@ -140,7 +151,7 @@ if ($svc.StartType -ne 'Automatic') {
         Set-Service -Name WinDefend -StartupType Automatic -ErrorAction Stop
         Log PASS "WinDefend startup type changed to Automatic (was $($svc.StartType))"
     } catch {
-        Log FAIL "Could not set WinDefend to Automatic. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). This may require disabling a GP that enforces the start type."
+        Log FAIL "Could not set WinDefend to Automatic. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). A GP may enforce the start type."
     }
 }
 
@@ -150,12 +161,12 @@ if ($svc.Status -ne 'Running') {
         Start-Sleep -Seconds 3
         $svc.Refresh()
         if ($svc.Status -eq 'Running') {
-            Log PASS "WinDefend service started successfully"
+            Log PASS "WinDefend service started"
         } else {
-            Log FAIL "WinDefend service did not reach Running state after 3 seconds. Current status: $($svc.Status). Check Event Viewer > Applications and Services > Microsoft > Windows > Windows Defender > Operational for details."
+            Log FAIL "WinDefend did not reach Running state (status: $($svc.Status)). Check Event Viewer > Applications and Services > Microsoft > Windows > Windows Defender > Operational."
         }
     } catch {
-        Log FAIL "Failed to start WinDefend service. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Common causes: Tamper Protection by third-party AV, GP enforcement, or the service is disabled at the driver level."
+        Log FAIL "Failed to start WinDefend. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Common causes: third-party AV tamper protection, GP enforcement, or service disabled at driver level."
     }
 } else {
     Log PASS "WinDefend service already running"
@@ -164,7 +175,7 @@ if ($svc.Status -ne 'Running') {
 # -- Step 4: Enable protections via Set-MpPreference --
 
 if (-not (Get-Module -ListAvailable -Name Defender -ErrorAction SilentlyContinue)) {
-    Log FAIL "Defender PowerShell module not found. Cannot configure protections. Verify Windows Defender is installed: Get-WindowsFeature Windows-Defender (Server) or check Add/Remove Windows Features (Desktop)."
+    Log FAIL "Defender PowerShell module not found. Cannot configure protections."
 } else {
     try {
         Set-MpPreference `
@@ -175,20 +186,19 @@ if (-not (Get-Module -ListAvailable -Name Defender -ErrorAction SilentlyContinue
             -DisableScriptScanning $false `
             -DisableArchiveScanning $false `
             -DisableIntrusionPreventionSystem $false `
-            -SignatureDisableUpdateOnStartupWithoutEngine $false `
             -MAPSReporting 2 `
             -SubmitSamplesConsent 1 `
             -ErrorAction Stop
-        Log PASS "All core protections enabled (RealTime, Behavior, BlockAtFirstSeen, IOAV, ScriptScanning, ArchiveScanning, IPS, MAPS=Advanced)"
+        Log PASS "Core protections enabled (RealTime, Behavior, BlockAtFirstSeen, IOAV, ScriptScanning, ArchiveScanning, IPS, MAPS=Advanced)"
     } catch {
-        Log FAIL "Set-MpPreference bulk call failed. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). A Group Policy may be overriding these settings. Check: HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
+        Log FAIL "Set-MpPreference failed. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). A GP may be overriding these settings. Check: HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
     }
 
     try {
         Set-MpPreference -EnableNetworkProtection Enabled -ErrorAction Stop
         Log PASS "Network Protection enabled"
     } catch {
-        Log WARN "Network Protection failed. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Requires Windows 10 1709+ or Server 2019+."
+        Log WARN "Network Protection not available. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Requires Server 2019+ or Windows 10 1709+."
     }
 }
 
@@ -196,9 +206,9 @@ if (-not (Get-Module -ListAvailable -Name Defender -ErrorAction SilentlyContinue
 
 try {
     Update-MpSignature -ErrorAction Stop
-    Log PASS "Signature update initiated successfully"
+    Log PASS "Signature update initiated"
 } catch {
-    Log WARN "Signature update failed. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Will retry automatically on next scheduled update cycle."
+    Log WARN "Signature update failed. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Will retry on next scheduled update cycle."
 }
 
 # -- Summary --
