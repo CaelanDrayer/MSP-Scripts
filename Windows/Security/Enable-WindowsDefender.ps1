@@ -62,27 +62,54 @@ if (-not $svc) {
         # Server OS: use Install-WindowsFeature (available on 2012+)
         $installCmd = Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue
         if (-not $installCmd) {
-            Log FAIL "Install-WindowsFeature not available. This server may be too old to support Windows Defender (requires Server 2012+)."
+            Log FAIL "Install-WindowsFeature cmdlet not available. This server may be too old (requires Server 2012+)."
             Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
             exit $script:ExitCode
         }
+
+        # Feature name varies by OS version:
+        #   Server 2016+    : Windows-Defender
+        #   Server 2012 R2  : Windows-Defender-Features, Windows-Server-Antimalware
+        #   Server 2012     : Windows-Server-Antimalware
+        $featureNames = @('Windows-Defender', 'Windows-Defender-Features', 'Windows-Server-Antimalware')
+        $targetFeature = $null
+
+        foreach ($fname in $featureNames) {
+            $feat = Get-WindowsFeature -Name $fname -ErrorAction SilentlyContinue
+            if ($feat) {
+                $targetFeature = $fname
+                if ($feat.Installed) {
+                    Log INFO "Feature '$fname' is already installed (state: $($feat.InstallState)). Service may need a reboot to appear."
+                }
+                break
+            }
+        }
+
+        if (-not $targetFeature) {
+            $available = Get-WindowsFeature -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Defend*' -or $_.Name -like '*Antimalware*' -or $_.Name -like '*Defender*' } | ForEach-Object { $_.Name }
+            $hint = if ($available) { "Similar features found: $($available -join ', ')" } else { "No Defender-related features found on this OS" }
+            Log FAIL "No known Defender feature name found. Tried: $($featureNames -join ', '). $hint. This OS may not support Windows Defender."
+            Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+            exit $script:ExitCode
+        }
+
         try {
-            Log INFO "Running: Install-WindowsFeature Windows-Defender (this may take several minutes)."
-            $result = Install-WindowsFeature -Name Windows-Defender -ErrorAction Stop
+            Log INFO "Installing feature '$targetFeature' (this may take several minutes)."
+            $result = Install-WindowsFeature -Name $targetFeature -ErrorAction Stop
             if ($result.Success) {
-                Log PASS "Windows Defender feature installed successfully."
+                Log PASS "Feature '$targetFeature' installed successfully."
                 if ($result.RestartNeeded -eq 'Yes') {
                     Log WARN "REBOOT REQUIRED to complete installation. Defender will not function until the server is restarted. Re-run this script after reboot."
                     Log INFO "=== Reboot required. Exit code: 1 ==="
                     exit 1
                 }
             } else {
-                Log FAIL "Install-WindowsFeature returned Success=False. Exit reason: $($result.ExitCode). Feature may already be partially installed or blocked by policy."
+                Log FAIL "Install-WindowsFeature '$targetFeature' returned Success=False. Exit reason: $($result.ExitCode). Feature may be blocked by policy or partially installed."
                 Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
                 exit $script:ExitCode
             }
         } catch {
-            Log FAIL "Failed to install Windows Defender feature. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Check that the feature is available: Get-WindowsFeature Windows-Defender"
+            Log FAIL "Failed to install feature '$targetFeature'. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Run 'Get-WindowsFeature *Defend*' to check available features."
             Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
             exit $script:ExitCode
         }
