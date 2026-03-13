@@ -3,9 +3,10 @@
     Enables Windows Defender. Designed for NinjaOne deployment.
 .DESCRIPTION
     1. Clears Group Policy registry overrides that disable Defender
-    2. Sets WinDefend service to Automatic and starts it
-    3. Enables all core protections via Set-MpPreference
-    4. Triggers a signature update
+    2. Installs Windows Defender feature if missing (Server OS)
+    3. Sets WinDefend service to Automatic and starts it
+    4. Enables all core protections via Set-MpPreference
+    5. Triggers a signature update
     Exit code 0 = all steps succeeded, 1 = one or more steps failed.
 #>
 
@@ -49,14 +50,61 @@ foreach ($key in $gpKeys) {
     }
 }
 
-# -- Step 2: Enable and start WinDefend service --
+# -- Step 2: Ensure Windows Defender is installed --
 
 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
 if (-not $svc) {
-    Log FAIL "WinDefend service not found. Windows Defender may not be installed. Check: Get-WindowsFeature Windows-Defender (Server) or Get-WindowsOptionalFeature -FeatureName Windows-Defender-Default-Definitions (Desktop)."
-    Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
-    exit $script:ExitCode
+    Log WARN "WinDefend service not found. Attempting to install Windows Defender feature."
+
+    # Detect OS type and attempt installation
+    $isServer = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue).ProductType -ne 1
+    if ($isServer) {
+        # Server OS: use Install-WindowsFeature (available on 2012+)
+        $installCmd = Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue
+        if (-not $installCmd) {
+            Log FAIL "Install-WindowsFeature not available. This server may be too old to support Windows Defender (requires Server 2012+)."
+            Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+            exit $script:ExitCode
+        }
+        try {
+            Log INFO "Running: Install-WindowsFeature Windows-Defender (this may take several minutes)."
+            $result = Install-WindowsFeature -Name Windows-Defender -ErrorAction Stop
+            if ($result.Success) {
+                Log PASS "Windows Defender feature installed successfully."
+                if ($result.RestartNeeded -eq 'Yes') {
+                    Log WARN "REBOOT REQUIRED to complete installation. Defender will not function until the server is restarted. Re-run this script after reboot."
+                    Log INFO "=== Reboot required. Exit code: 1 ==="
+                    exit 1
+                }
+            } else {
+                Log FAIL "Install-WindowsFeature returned Success=False. Exit reason: $($result.ExitCode). Feature may already be partially installed or blocked by policy."
+                Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+                exit $script:ExitCode
+            }
+        } catch {
+            Log FAIL "Failed to install Windows Defender feature. Error: $($_.Exception.GetType().Name): $($_.Exception.Message). Check that the feature is available: Get-WindowsFeature Windows-Defender"
+            Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+            exit $script:ExitCode
+        }
+    } else {
+        # Desktop OS: Defender should always be present. If the service is missing, something is seriously wrong.
+        Log FAIL "WinDefend service not found on desktop OS ($([Environment]::OSVersion.VersionString)). Defender may have been removed by third-party antivirus or system modification. Check: Get-WindowsOptionalFeature -Online -FeatureName Windows-Defender-Default-Definitions"
+        Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+        exit $script:ExitCode
+    }
+
+    # Re-check for the service after installation
+    Start-Sleep -Seconds 5
+    $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Log FAIL "WinDefend service still not found after feature installation. A reboot may be required."
+        Log INFO "=== Aborted. Exit code: $script:ExitCode ==="
+        exit $script:ExitCode
+    }
+    Log PASS "WinDefend service now available after feature installation."
 }
+
+# -- Step 3: Enable and start WinDefend service --
 
 Log INFO "WinDefend service: Status=$($svc.Status), StartType=$($svc.StartType)"
 
@@ -86,7 +134,7 @@ if ($svc.Status -ne 'Running') {
     Log PASS "WinDefend service already running"
 }
 
-# -- Step 3: Enable protections via Set-MpPreference --
+# -- Step 4: Enable protections via Set-MpPreference --
 
 if (-not (Get-Module -ListAvailable -Name Defender -ErrorAction SilentlyContinue)) {
     Log FAIL "Defender PowerShell module not found. Cannot configure protections. Verify Windows Defender is installed: Get-WindowsFeature Windows-Defender (Server) or check Add/Remove Windows Features (Desktop)."
@@ -117,7 +165,7 @@ if (-not (Get-Module -ListAvailable -Name Defender -ErrorAction SilentlyContinue
     }
 }
 
-# -- Step 4: Signature update --
+# -- Step 5: Signature update --
 
 try {
     Update-MpSignature -ErrorAction Stop
