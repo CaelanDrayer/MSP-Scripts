@@ -3,9 +3,9 @@
     Validates that Windows Defender is online and all protections are active.
 .DESCRIPTION
     Checks WinDefend service, queries Get-MpComputerStatus for protection flags,
-    and checks signature freshness. Outputs a color-coded status table.
+    signature freshness, running mode, and GP/passive-mode registry overrides.
+    Outputs a color-coded status table.
     Designed for NinjaOne deployment (runs as SYSTEM).
-    Compatible with PowerShell 5.1+.
     Exit code 0 = all checks pass, 1 = one or more failures, 2 = Defender unavailable.
 #>
 
@@ -22,17 +22,20 @@ function Check([string]$Name, [string]$Status, [string]$Value) {
 
 # -- Header --
 
+$os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+$caption = if ($os) { $os.Caption.Trim() } else { 'Unknown' }
+
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host " Windows Defender Validation - $env:COMPUTERNAME" -ForegroundColor Cyan
-Write-Host " $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | OS: $([Environment]::OSVersion.VersionString)" -ForegroundColor Cyan
+Write-Host " $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | OS: $caption" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 
 # -- Check 1: WinDefend service --
 
 $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
 if (-not $svc) {
-    Check "WinDefend Service" FAIL "Service not found. Windows Defender may not be installed. Check: Get-WindowsFeature Windows-Defender (Server) or Windows Features (Desktop)."
+    Check "WinDefend Service" FAIL "Not found. Defender may not be installed."
     $script:ExitCode = 2
 } else {
     $svcStatus = if ($svc.Status -eq 'Running') { 'PASS' } else { 'FAIL' }
@@ -47,7 +50,7 @@ if (-not $svc) {
 
 $mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
 if (-not $mp) {
-    Check "Get-MpComputerStatus" FAIL "Command unavailable or Defender not installed. Defender PowerShell module may be missing. Check: Get-Module -ListAvailable -Name Defender"
+    Check "Get-MpComputerStatus" FAIL "Unavailable. Defender module may be missing."
     $script:ExitCode = 2
 } else {
     $protections = [ordered]@{
@@ -63,9 +66,9 @@ if (-not $mp) {
 
     foreach ($p in $protections.GetEnumerator()) {
         $val = $mp.$($p.Value)
-        if ($null -eq $val) { Check $p.Key WARN "Property not available on this OS version" }
+        if ($null -eq $val) { Check $p.Key WARN "Not available on this OS" }
         elseif ($val)        { Check $p.Key PASS "Enabled" }
-        else                 { Check $p.Key FAIL "DISABLED - Run Enable-WindowsDefender.ps1 to remediate" }
+        else                 { Check $p.Key FAIL "DISABLED" }
     }
 
     # Versions
@@ -86,7 +89,7 @@ if (-not $mp) {
         if ($mp.IsTamperProtected) {
             Check "Tamper Protection" PASS "Enabled"
         } else {
-            Check "Tamper Protection" WARN "Disabled (recommend enabling via Windows Security > Virus & threat protection > Tamper Protection)"
+            Check "Tamper Protection" WARN "Disabled"
         }
     }
 
@@ -100,9 +103,9 @@ if (-not $mp) {
         if ($ageHours -lt 168) {
             Check "Signature Age" PASS $sigStr
         } elseif ($ageHours -lt 336) {
-            Check "Signature Age" WARN "$sigStr - Run Update-MpSignature to update"
+            Check "Signature Age" WARN "$sigStr - stale"
         } else {
-            Check "Signature Age" FAIL "$sigStr - Run Update-MpSignature to update"
+            Check "Signature Age" FAIL "$sigStr - critically stale"
         }
 
         $sigVer = $mp.AntivirusSignatureVersion; if (-not $sigVer) { $sigVer = "Unknown" }
@@ -112,7 +115,7 @@ if (-not $mp) {
     }
 }
 
-# -- Check 3: GP overrides that may be disabling Defender --
+# -- Check 3: GP overrides --
 
 $gpKeys = @(
     'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
@@ -132,9 +135,23 @@ foreach ($key in $gpKeys) {
 }
 
 if ($foundGpOverrides.Count -gt 0) {
-    Check "GP Override Detection" WARN "Found $($foundGpOverrides.Count) active GP override(s) that may disable protections: $($foundGpOverrides -join '; ')"
+    Check "GP Overrides" WARN "Found $($foundGpOverrides.Count): $($foundGpOverrides -join '; ')"
 } else {
-    Check "GP Override Detection" PASS "No disabling GP overrides found"
+    Check "GP Overrides" PASS "None found"
+}
+
+# -- Check 4: ForceDefenderPassiveMode --
+
+$passiveKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+if (Test-Path $passiveKey) {
+    $passiveProp = Get-ItemProperty -Path $passiveKey -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue
+    if ($null -ne $passiveProp -and $passiveProp.ForceDefenderPassiveMode -eq 1) {
+        Check "Passive Mode Override" WARN "ForceDefenderPassiveMode=1. Defender is in passive mode."
+    } else {
+        Check "Passive Mode Override" PASS "Not set"
+    }
+} else {
+    Check "Passive Mode Override" PASS "Not set"
 }
 
 # -- Results table --
@@ -145,19 +162,19 @@ $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $infoCount = @($results | Where-Object { $_.Status -eq 'INFO' }).Count
 
 Write-Host ""
-Write-Host "--- Validation Results ---" -ForegroundColor Cyan
+Write-Host "--- Results ---" -ForegroundColor Cyan
 Write-Host ""
 
 $col1 = 24; $col2 = 7
 Write-Host ("Check".PadRight($col1) + "Status".PadRight($col2) + "Value") -ForegroundColor Cyan
-Write-Host ("-" * 100) -ForegroundColor Cyan
+Write-Host ("-" * 90) -ForegroundColor Cyan
 
 foreach ($r in $results) {
     $line = $r.Check.PadRight($col1) + $r.Status.PadRight($col2) + $r.Value
     Write-Host $line -ForegroundColor $colors[$r.Status]
 }
 
-Write-Host ("-" * 100) -ForegroundColor Cyan
+Write-Host ("-" * 90) -ForegroundColor Cyan
 
 if ($failCount -gt 0) { $summaryColor = 'Red' }
 elseif ($warnCount -gt 0) { $summaryColor = 'Yellow' }
@@ -167,13 +184,13 @@ Write-Host "PASS: $passCount  WARN: $warnCount  FAIL: $failCount  INFO: $infoCou
 Write-Host ""
 
 if ($script:ExitCode -eq 2) {
-    Write-Host "RESULT: DEFENDER UNAVAILABLE - Windows Defender is not installed or accessible on this system." -ForegroundColor Red
+    Write-Host "RESULT: UNAVAILABLE - Defender is not installed or accessible." -ForegroundColor Red
 } elseif ($failCount -gt 0) {
-    Write-Host "RESULT: FAILED - One or more required protections are disabled. Run Enable-WindowsDefender.ps1 to remediate." -ForegroundColor Red
+    Write-Host "RESULT: FAILED - Run Enable-WindowsDefender.ps1 to remediate." -ForegroundColor Red
 } elseif ($warnCount -gt 0) {
-    Write-Host "RESULT: WARNINGS - Defender is running but review warnings above." -ForegroundColor Yellow
+    Write-Host "RESULT: WARNINGS - Review items above." -ForegroundColor Yellow
 } else {
-    Write-Host "RESULT: PASS - Windows Defender is fully operational." -ForegroundColor Green
+    Write-Host "RESULT: PASS - Defender is fully operational." -ForegroundColor Green
 }
 
 Write-Host ""
